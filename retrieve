@@ -1,0 +1,35 @@
+local args = {...}
+
+--retrieval control computer for base-inventory system.
+
+--retrieved items arrive in chest on top of turtle.
+--items to be retrieved are selected by user and a quadracoptor summoned.  Quad base is behind turtle.
+
+--configuration table, can be changed by a config file.
+if not os.loadAPI("configuration") then error("Could not load configuration API!") end
+local config = configuration.load("retrieve.conf")
+if not os.loadAPI("storage") then error("Could not load storage API!") end
+storage.initialize(config)
+
+local itemRetrievalQueue = {}
+
+if #args > 0 then
+	local damage = 0
+	if #args == 3 then
+		damage = tonumber(args[3])
+	end
+	local itemDetails = {
+		name = args[1],
+		count = tonumber(args[2]),
+		damage = damage,
+	}
+	local success, count = storage.retrieve(itemDetails)
+	if success or count < itemDetails.count then
+		storage.fly()
+	else
+		return
+	end
+	os.pullEvent("quad_landed")
+	turtle.suckUp()
+	turtle.drop()
+end
