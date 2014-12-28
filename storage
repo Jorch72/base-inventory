@@ -1,35 +1,16 @@
---storage control computer for base-inventory system.
+--storage api for base-inventory system.
 
---new items arrive in chest in front of turtle.
---items to be stored are placed in chest on top of turtle and a quadracoptor summoned.  Quad base is behind turtle.
---items to be sent out are pulled from storage and sent to output chest.
-
-local baseStation = peripheral.wrap("back")
-
---configuration table, can be changed by a config file.
 local config = {
-	chestName = "minecraft:chest",
-	chestSlots = 36,
-	tubes = 1,
-	layers = 1,
+	baseStationSide = "back",
+	databasePath = "storagedata",
+	chestSlots = 27,
+	routePieces = {},
+	tubes = 0,
+	layers = 0,
 }
 
-local checkItemsTimer = os.startTimer(0)
-local processItemsTimer
-local itemProcessingQueue = {}
-
---storage database table, indexed by tube ID, layer #, chest #.  Actual data table contains name and total count in chest.
+local baseStation
 local storageDatabase = {}
-
-for i = 1, config.tubes do
-	storageDatabase[i] = {}
-	for j = 1, config.layers do
-		storageDatabase[i][j] = {}
-		for k = 1, 4 do
-			storageDatabase[i][j][k] = {name = "empty", count = 0}
-		end
-	end
-end
 
 --item lookup table, indexed by item name. Contains a table of tube ID, layer #, chest # triplets of which storage chests the item can be found in.
 local itemLookup = {}
@@ -37,25 +18,28 @@ local itemLookup = {}
 --item database table, intended to be fetched from master station.  Indexed by item name, contains general information about that item, like max stack size, as well as the ways the system can produce that item (crafting, etc.)
 local itemDatabase = {}
 
-local routePieces = {
-	tube = {
-		{"north 3"}
-	},
-	layer = {
-		{"down 3"}
-	},
-	chest = {
-		{"west"},
-		{"north"},
-		{"east"},
-		{"south"},
-	},
-	start = {"up", "south"}
-}
+--item processing queue, these are routes to fly, along with transaction IDs.
+local processingQueue = {}
+
+--item movement transactions, to allow read/write to occur all at once when the quad is dispatched.
+local openTransactions = {}
+
+local function prepareDatabase()
+	--initial fill of storageDatabase dimensions
+	for i = 1, config.tubes do
+		storageDatabase[i] = {}
+		for j = 1, config.layers do
+			storageDatabase[i][j] = {}
+			for k = 1, 4 do
+				storageDatabase[i][j][k] = {name = "empty", count = 0}
+			end
+		end
+	end
+end
 
 --load storage database from disk.
-do
-	local handle = io.open("storagedata", "r")
+local function readStorageDatabase()
+	local handle = io.open(config.databasePath, "r")
 	if handle then
 		for line in handle:lines() do
 			local tube, layer, chest, count, name = string.match(line, "^(%d+),(%d+),(%d+);(%d+) (.*)")
@@ -68,7 +52,7 @@ do
 end
 
 local function writeStorageDatabase()
-	local handle = io.open("storagedata", "w")
+	local handle = io.open(config.databasePath, "w")
 	if handle then
 		for i = 1, #storageDatabase do
 			for j = 1, #storageDatabase[i] do
@@ -81,20 +65,93 @@ local function writeStorageDatabase()
 	end
 end
 
+local function prepareLookupTable()
+	--assumes completely loaded and up to date storageDatabase.
+	for i = 1, #storageDatabase do
+		for j = 1, #storageDatabase[i] do
+			for k = 1, #storageDatabase[i][j] do
+				if not itemLookup[storageDatabase[i][j][k].name] then
+					itemLookup[storageDatabase[i][j][k].name] = {}
+				end
+				table.insert(itemLookup[storageDatabase[i][j][k].name], {i, j, k})
+			end
+		end
+	end
+end
+
+
+
+function initialize(configuration)
+	for k, v in pairs(configuration) do
+		if config[k] then
+			config[k] = v
+		end
+	end
+	baseStation = peripheral.wrap(config.baseStationSide)
+	prepareDatabase()
+	readStorageDatabase()
+	prepareLookupTable()
+end
+
+local function transaction(tube, layer, chest, name, delta)
+	readStorageDatabase()
+	storageDatabase[tube][layer][chest].count = storageDatabase[tube][layer][chest].count + delta
+	if storageDatabase[tube][layer][chest].count > 0 then
+		storageDatabase[tube][layer][chest].name = name
+	else
+		storageDatabase[tube][layer][chest].name = "empty"
+	end
+	writeStorageDatabase()
+end
+
 local function createStorageRoute(tube, layer, chest, count)
-	local route = {unpack(routePieces.start)}
-	route[3] = "suck "..tostring(count)
-	for i = 1, #routePieces.tube[tube] do
-		route[#route + 1] = routePieces.tube[tube][i]
+	local route = {unpack(config.routePieces.store.start)}
+	route[#route + 1] = "suck "..tostring(count)
+	for i = 1, #config.routePieces.store.postStart do
+		route[#route + 1] = config.routePieces.store.postStart[i]
 	end
-	for i = 1, #routePieces.layer[layer] do
-		route[#route + 1] = routePieces.layer[layer][i]
+	for i = 1, #config.routePieces.out.tube[tube] do
+		route[#route + 1] = config.routePieces.out.tube[tube][i]
 	end
-	for i = 1, #routePieces.chest[chest] do
-		route[#route + 1] = routePieces.chest[chest][i]
+	for i = 1, #config.routePieces.out.layer[layer] do
+		route[#route + 1] = config.routePieces.out.layer[layer][i]
+	end
+	for i = 1, #config.routePieces.out.chest[chest] do
+		route[#route + 1] = config.routePieces.out.chest[chest][i]
 	end
 	route[#route + 1] = "drop"
 	route[#route + 1] = "return"
+	return route
+end
+
+local function createRetrievalRoute(tube, layer, chest, count)
+	local route = {unpack(config.routePieces.retrieve.start)}
+	for i = 1, #config.routePieces.out.tube[tube] do
+		route[#route + 1] = config.routePieces.out.tube[tube][i]
+	end
+	for i = 1, #config.routePieces.out.layer[layer] do
+		route[#route + 1] = config.routePieces.out.layer[layer][i]
+	end
+	for i = 1, #config.routePieces.out.chest[chest] do
+		route[#route + 1] = config.routePieces.out.chest[chest][i]
+	end
+	route[#route + 1] = "suck "..tostring(count)
+	for i = 1, #config.routePieces.back.chest[chest] do
+		route[#route + 1] = config.routePieces.back.chest[chest][i]
+	end
+	for i = 1, #config.routePieces.back.layer[layer] do
+		route[#route + 1] = config.routePieces.back.layer[layer][i]
+	end
+	for i = 1, #config.routePieces.back.tube[tube] do
+		route[#route + 1] = config.routePieces.back.tube[tube][i]
+	end
+	for i = 1, #config.routePieces.retrieve.preFinish do
+		route[#route + 1] = config.routePieces.retrieve.preFinish[i]
+	end
+	route[#route + 1] = "drop"
+	for i = 1, #config.routePieces.retrieve.finish do
+		route[#route + 1] = config.routePieces.retrieve.finish[i]
+	end
 	return route
 end
 
@@ -108,79 +165,90 @@ local function getCompoundName(data)
 	end
 end
 
-local function queueRoute(slot, tube, layer, chest)
-	table.insert(itemProcessingQueue, {slot = slot, tube = tube, layer = layer, chest = chest})
-	if not processItemsTimer then processItemsTimer = os.startTimer(0) end
-end
-
-while true do
-	local event = {os.pullEvent()}
-	if event[1] == "timer" and event[2] == checkItemsTimer then
-		--check for new items in input chest.
-		for i = 1, 16 do
-			turtle.select(i)
-			turtle.suck()
-		end
-		for i = 1, 16 do
-			local data = turtle.getItemDetail(i)
-			if data then
-				turtle.select(i)
-				local itemStored = false
-				local name = getCompoundName(data)
-				if itemLookup[name] then
-					for j, v in ipairs(itemLookup[name]) do
-						local store = storageDatabase[v[1]][v[2]][v[3]]
-						if store.name == name then
-							if not itemDatabase[data.name] then
-								itemDatabase[data.name] = {}
-								itemDatabase[data.name].maxStackSize = 64
-							end
-							if store.count <= config.chestSlots * itemDatabase[data.name].maxStackSize - data.count then
-								--store the item.
-								local route = createStorageRoute(v[1], v[2], v[3], data.count)
-								table.insert(itemProcessingQueue, route)
-								turtle.dropUp()
-								store.count = store.count + data.count
-								writeStorageDatabase()
-								itemStored = true
-								break
-							end
-						end
-					end
+function store(itemData)
+	local name = getCompoundName(itemData)
+	local count = itemData.count
+	if itemLookup[name] then
+		for k, v in ipairs(itemLookup[name]) do
+			local store = storageDatabase[v[1]][v[2]][v[3]]
+			if store.name == name then
+				--database agrees that this is here.
+				if not itemDatabase[itemData.name] then
+					itemDatabase[itemData.name] = {}
+					itemDatabase[itemData.name].maxStackSize = 64
 				end
-				if not itemStored then
-					--item wasn't in our database yet, or no chests had room.  Will need to allocate new chest for it.
-					for j = 1, #storageDatabase do
-						for k = 1, #storageDatabase[j] do
-							for l = 1, #storageDatabase[j][k] do
-								if storageDatabase[j][k][l] and storageDatabase[j][k][l].name == "empty" then
-									--found a storage spot
-									storageDatabase[j][k][l].name = getCompoundName(data)
-									storageDatabase[j][k][l].count = data.count
-									local route = createStorageRoute(j, k, l, data.count)
-									table.insert(itemProcessingQueue, route)
-									turtle.dropUp()
-									writeStorageDatabase()
-									itemStored = true
-									break
-								end
-							end
-							if itemStored then break end
-						end
-						if itemStored then break end
-					end
-				end
-				if not itemStored then
-					--put the item back in the input chest.
-					turtle.drop()
+				if store.count < config.chestSlots * itemDatabase[itemData.name].maxStackSize then
+					--store the item, or at least some of it.
+					local moveQuantity = math.min(config.chestSlots * itemDatabase[itemData.name].maxStackSize - store.count, count)
+					transaction(v[1], v[2], v[3], name, moveQuantity)
+					storage.queueRoute(createStorageRoute(v[1], v[2], v[3], moveQuantity))
+					count = count - moveQuantity
+					if count == 0 then break end
 				end
 			end
 		end
-		local route = table.remove(itemProcessingQueue, 1)
-		while route do
-			baseStation.flyQuad(route)
-			route = table.remove(itemProcessingQueue, 1)
+	end
+	if count > 0 then
+		--item wasn't yet in db, or existing chests didn't have enough room.  Allocate new chest.
+		for i = 1, #storageDatabase do
+			for j = 1, #storageDatabase[i] do
+				for k = 1, #storageDatabase[i][j] do
+					if storageDatabase[i][j][k] and storageDatabase[i][j][k].name == "empty" then
+						if not itemLookup[name] then
+							itemLookup[name] = {}
+						end
+						table.insert(itemLookup[name], {i, j, k})
+						transaction(i, j, k, name, count)
+						storage.queueRoute(createStorageRoute(i, j, k, count))
+						count = 0
+						break
+					end
+				end
+			end
 		end
-		checkItemsTimer = os.startTimer(2)
+	end
+	if count > 0 then
+		return false
+	else
+		return true
+	end
+end
+
+function retrieve(itemData)
+	local name = getCompoundName(itemData)
+	local count = itemData.count
+	for i = #storageDatabase, 1, -1 do
+		for j = #storageDatabase[i], 1, -1 do
+			for k = #storageDatabase[i][j], 1, -1 do
+				if storageDatabase[i][j][k] and storageDatabase[i][j][k].name == name then
+					--here is a chest that has the correct things in it.
+					local moveQuantity = math.min(storageDatabase[i][j][k].count, count)
+					transaction(i, j, k, name, moveQuantity * -1)
+					storage.queueRoute(createRetrievalRoute(i, j, k, moveQuantity))
+					count = count - moveQuantity
+					if count == 0 then break end
+				end
+			end
+			if count == 0 then break end
+		end
+		if count == 0 then break end
+	end
+	if count > 0 then
+		return false, count
+	else
+		return true
+	end
+end
+
+
+function queueRoute(routeInfo)
+	table.insert(processingQueue, routeInfo)
+end
+
+function fly()
+	--send out quad on route if any are queued
+	local routeInfo = table.remove(processingQueue, 1)
+	if routeInfo then
+		baseStation.flyQuad(routeInfo)
 	end
 end

@@ -1,0 +1,41 @@
+--storage control computer for base-inventory system.
+
+--new items arrive in chest in front of turtle.
+--items to be stored are placed in chest on top of turtle and a quadracoptor summoned.  Quad base is behind turtle.
+--items to be sent out are pulled from storage and sent to output chest.
+
+--configuration table, can be changed by a config file.
+if not os.loadAPI("configuration") then error("Could not load configuration API!") end
+local config = configuration.load("store.conf")
+if not os.loadAPI("storage") then error("Could not load storage API!") end
+storage.initialize(config)
+
+local checkItemsTimer = os.startTimer(0.5)
+
+while true do
+	local event = {os.pullEvent()}
+	if event[1] == "timer" and event[2] == checkItemsTimer then
+		local count = 0
+		--check for new items in input chest.
+		for i = 1, 16 do
+			turtle.select(i)
+			turtle.suck()
+		end
+		for i = 1, 16 do
+			if turtle.getItemCount(i) > 0 then
+				turtle.select(i)
+				if storage.store(turtle.getItemDetail(i)) then
+					turtle.dropUp()
+					count = count + 1
+				else
+					turtle.drop()
+				end
+			end
+		end
+		for i = 1, count do
+			storage.fly()
+			sleep(0.3)
+		end
+		checkItemsTimer = os.startTimer(2)
+	end
+end
